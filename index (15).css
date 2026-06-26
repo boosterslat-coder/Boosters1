@@ -1,0 +1,181 @@
+/*
+  # Portal App - Initial Schema
+
+  ## Overview
+  Creates all tables needed for the Portal lottery app.
+
+  ## Tables
+  - `app_settings` - Key/value store for global settings (e.g. app_locked flag)
+  - `waiting_list` - Stores emails of users waiting for the app to launch
+  - `profiles` - Extended user data: username, avatar, balance, owner fee balance
+  - `lottery_games` - Each game is a round with 10 player slots and one winner
+  - `lottery_game_players` - Join table linking users to games (each = one ticket)
+  - `transactions` - Full ledger of all deposits, withdrawals, wins, refunds, and fees
+
+  ## Security
+  - RLS enabled on every table
+  - Users can only read/write their own data
+  - Lottery game visibility is public (read-only) so users can see open games
+  - Transactions visible only to owner
+*/
+
+-- ─── APP SETTINGS ────────────────────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS app_settings (
+  key   text PRIMARY KEY,
+  value text NOT NULL DEFAULT ''
+);
+
+ALTER TABLE app_settings ENABLE ROW LEVEL SECURITY;
+
+-- Only authenticated users can read settings (app_locked is a public concern so we allow anon too)
+CREATE POLICY "Anyone can read app settings"
+  ON app_settings FOR SELECT
+  TO anon, authenticated
+  USING (true);
+
+-- Only service_role / edge functions can write settings (no direct client writes)
+-- (no INSERT/UPDATE policy for authenticated - admin sets via service role)
+
+-- Seed the locked flag
+INSERT INTO app_settings (key, value) VALUES ('app_locked', 'true') ON CONFLICT DO NOTHING;
+
+-- ─── WAITING LIST ────────────────────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS waiting_list (
+  id         uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  email      text UNIQUE NOT NULL,
+  created_at timestamptz DEFAULT now(),
+  notified   boolean DEFAULT false
+);
+
+ALTER TABLE waiting_list ENABLE ROW LEVEL SECURITY;
+
+CREATE POLICY "Anyone can insert their email"
+  ON waiting_list FOR INSERT
+  TO anon, authenticated
+  WITH CHECK (true);
+
+CREATE POLICY "Users can read waiting list count"
+  ON waiting_list FOR SELECT
+  TO anon, authenticated
+  USING (true);
+
+-- ─── PROFILES ────────────────────────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS profiles (
+  id           uuid PRIMARY KEY REFERENCES auth.users(id) ON DELETE CASCADE,
+  username     text NOT NULL DEFAULT '',
+  avatar_url   text DEFAULT '',
+  balance      numeric(10,2) NOT NULL DEFAULT 0.00,
+  fee_balance  numeric(10,2) NOT NULL DEFAULT 0.00,
+  is_admin     boolean NOT NULL DEFAULT false,
+  created_at   timestamptz DEFAULT now(),
+  updated_at   timestamptz DEFAULT now()
+);
+
+ALTER TABLE profiles ENABLE ROW LEVEL SECURITY;
+
+CREATE POLICY "Users can view own profile"
+  ON profiles FOR SELECT
+  TO authenticated
+  USING (auth.uid() = id);
+
+CREATE POLICY "Users can insert own profile"
+  ON profiles FOR INSERT
+  TO authenticated
+  WITH CHECK (auth.uid() = id);
+
+CREATE POLICY "Users can update own profile"
+  ON profiles FOR UPDATE
+  TO authenticated
+  USING (auth.uid() = id)
+  WITH CHECK (auth.uid() = id);
+
+-- ─── LOTTERY GAMES ───────────────────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS lottery_games (
+  id              uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  status          text NOT NULL DEFAULT 'open'  CHECK (status IN ('open','completed','refunded')),
+  winner_user_id  uuid REFERENCES profiles(id) ON DELETE SET NULL,
+  created_at      timestamptz DEFAULT now(),
+  completed_at    timestamptz,
+  expires_at      timestamptz DEFAULT (now() + INTERVAL '24 hours')
+);
+
+ALTER TABLE lottery_games ENABLE ROW LEVEL SECURITY;
+
+CREATE POLICY "Anyone can view lottery games"
+  ON lottery_games FOR SELECT
+  TO authenticated
+  USING (true);
+
+-- ─── LOTTERY GAME PLAYERS ────────────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS lottery_game_players (
+  id         uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  game_id    uuid NOT NULL REFERENCES lottery_games(id) ON DELETE CASCADE,
+  user_id    uuid NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,
+  slot       int NOT NULL CHECK (slot BETWEEN 1 AND 10),
+  joined_at  timestamptz DEFAULT now(),
+  UNIQUE (game_id, user_id),
+  UNIQUE (game_id, slot)
+);
+
+ALTER TABLE lottery_game_players ENABLE ROW LEVEL SECURITY;
+
+CREATE POLICY "Authenticated users can view game players"
+  ON lottery_game_players FOR SELECT
+  TO authenticated
+  USING (true);
+
+CREATE POLICY "Users can insert themselves into games"
+  ON lottery_game_players FOR INSERT
+  TO authenticated
+  WITH CHECK (auth.uid() = user_id);
+
+-- ─── TRANSACTIONS ────────────────────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS transactions (
+  id          uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id     uuid NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,
+  type        text NOT NULL CHECK (type IN ('deposit','withdrawal','ticket_purchase','win','refund','fee_withdrawal')),
+  amount      numeric(10,2) NOT NULL,
+  status      text NOT NULL DEFAULT 'completed' CHECK (status IN ('pending','completed','failed')),
+  description text DEFAULT '',
+  created_at  timestamptz DEFAULT now()
+);
+
+ALTER TABLE transactions ENABLE ROW LEVEL SECURITY;
+
+CREATE POLICY "Users can view own transactions"
+  ON transactions FOR SELECT
+  TO authenticated
+  USING (auth.uid() = user_id);
+
+CREATE POLICY "Users can insert own transactions"
+  ON transactions FOR INSERT
+  TO authenticated
+  WITH CHECK (auth.uid() = user_id);
+
+-- ─── INDEXES ─────────────────────────────────────────────────────────────────
+CREATE INDEX IF NOT EXISTS idx_lottery_games_status ON lottery_games(status);
+CREATE INDEX IF NOT EXISTS idx_lottery_game_players_game_id ON lottery_game_players(game_id);
+CREATE INDEX IF NOT EXISTS idx_lottery_game_players_user_id ON lottery_game_players(user_id);
+CREATE INDEX IF NOT EXISTS idx_transactions_user_id ON transactions(user_id);
+CREATE INDEX IF NOT EXISTS idx_waiting_list_email ON waiting_list(email);
+
+-- ─── AUTO-CREATE PROFILE ON SIGNUP ───────────────────────────────────────────
+CREATE OR REPLACE FUNCTION public.handle_new_user()
+RETURNS trigger
+LANGUAGE plpgsql SECURITY DEFINER
+AS $$
+BEGIN
+  INSERT INTO public.profiles (id, username)
+  VALUES (
+    NEW.id,
+    COALESCE(NEW.raw_user_meta_data->>'username', split_part(NEW.email, '@', 1))
+  )
+  ON CONFLICT (id) DO NOTHING;
+  RETURN NEW;
+END;
+$$;
+
+DROP TRIGGER IF EXISTS on_auth_user_created ON auth.users;
+CREATE TRIGGER on_auth_user_created
+  AFTER INSERT ON auth.users
+  FOR EACH ROW EXECUTE FUNCTION public.handle_new_user();

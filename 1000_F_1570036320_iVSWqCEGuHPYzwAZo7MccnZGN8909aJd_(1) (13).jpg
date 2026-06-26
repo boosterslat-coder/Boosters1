@@ -1,0 +1,186 @@
+import "jsr:@supabase/functions-js/edge-runtime.d.ts";
+
+const corsHeaders = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
+  "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Client-Info, Apikey",
+};
+
+Deno.serve(async (req: Request) => {
+  if (req.method === "OPTIONS") {
+    return new Response(null, { status: 200, headers: corsHeaders });
+  }
+
+  try {
+    const { game_id } = await req.json();
+
+    const supabaseUrl = Deno.env.get("SUPABASE_URL");
+    const serviceRoleKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
+    const headers = {
+      Authorization: `Bearer ${serviceRoleKey}`,
+      apikey: serviceRoleKey,
+    };
+
+    // Fetch game players
+    const playersRes = await fetch(
+      `${supabaseUrl}/rest/v1/lottery_game_players?game_id=eq.${game_id}&select=user_id`,
+      { headers }
+    );
+    if (!playersRes.ok) throw new Error("Failed to fetch game players");
+    const players = await playersRes.json() as Array<{ user_id: string }>;
+
+    if (players.length < 10) {
+      return new Response(
+        JSON.stringify({ message: "Game not full yet" }),
+        { headers: { ...corsHeaders, "Content-Type": "application/json" }, status: 200 }
+      );
+    }
+
+    // Fetch settings
+    const settingsRes = await fetch(
+      `${supabaseUrl}/rest/v1/app_settings?key=in.(weight_base,weight_per_loss,guaranteed_after,entry_fee)`,
+      { headers }
+    );
+    const settings = await settingsRes.json() as Array<{ key: string; value: string }>;
+    const getSetting = (key: string, fallback: number) =>
+      Number(settings.find(s => s.key === key)?.value ?? fallback);
+
+    const weightBase = getSetting("weight_base", 100);
+    const weightPerLoss = getSetting("weight_per_loss", 25);
+    const guaranteedAfter = getSetting("guaranteed_after", 9);
+    const entryFee = getSetting("entry_fee", 1);
+    const prizePool = players.length * entryFee;
+
+    // Fetch all player profiles with fairness data
+    const userIds = players.map(p => p.user_id);
+    const profilesRes = await fetch(
+      `${supabaseUrl}/rest/v1/profiles?id=in.(${userIds.join(",")})&select=id,losses_since_last_win,username`,
+      { headers }
+    );
+    const profilesData = await profilesRes.json() as Array<{
+      id: string;
+      losses_since_last_win: number;
+      username: string;
+    }>;
+
+    // ─── FAIRNESS ALGORITHM V2 ─────────────────────────────────
+    // Step 1: Check for guaranteed win (lossesSinceLastWin >= 9)
+    const guaranteedPlayers = profilesData.filter(
+      p => p.losses_since_last_win >= guaranteedAfter
+    );
+
+    let winnerUserId: string;
+    let wasGuaranteed = false;
+
+    if (guaranteedPlayers.length > 0) {
+      // Find the highest loss count among guaranteed players
+      const highestLossCount = Math.max(
+        ...guaranteedPlayers.map(p => p.losses_since_last_win)
+      );
+      // If multiple at same highest count, random pick among them
+      const candidates = guaranteedPlayers.filter(
+        p => p.losses_since_last_win === highestLossCount
+      );
+      winnerUserId = candidates[Math.floor(Math.random() * candidates.length)].id;
+      wasGuaranteed = true;
+    } else {
+      // Weighted random selection: weight = 100 + (losses * 25)
+      const weighted = profilesData.map(p => ({
+        id: p.id,
+        weight: weightBase + (p.losses_since_last_win * weightPerLoss),
+      }));
+      const totalWeight = weighted.reduce((sum, w) => sum + w.weight, 0);
+      let roll = Math.random() * totalWeight;
+      winnerUserId = weighted[0].id;
+      for (const w of weighted) {
+        roll -= w.weight;
+        if (roll <= 0) {
+          winnerUserId = w.id;
+          break;
+        }
+      }
+    }
+
+    // ─── UPDATE GAME STATUS ────────────────────────────────────
+    await fetch(`${supabaseUrl}/rest/v1/lottery_games?id=eq.${game_id}`, {
+      method: "PATCH",
+      headers: { ...headers, "Content-Type": "application/json" },
+      body: JSON.stringify({
+        status: "completed",
+        winner_user_id: winnerUserId,
+        prize_amount: prizePool,
+        completed_at: new Date().toISOString(),
+      }),
+    });
+
+    // ─── CREDIT WINNER ─────────────────────────────────────────
+    const winnerProfileRes = await fetch(
+      `${supabaseUrl}/rest/v1/profiles?id=eq.${winnerUserId}&select=balance,total_wins,losses_since_last_win`,
+      { headers }
+    );
+    const winnerProfileArr = await winnerProfileRes.json();
+    const winnerProfile = winnerProfileArr[0];
+    const newBalance = (winnerProfile?.balance ?? 0) + prizePool;
+
+    await fetch(`${supabaseUrl}/rest/v1/profiles?id=eq.${winnerUserId}`, {
+      method: "PATCH",
+      headers: { ...headers, "Content-Type": "application/json" },
+      body: JSON.stringify({
+        balance: newBalance,
+        total_wins: (winnerProfile?.total_wins ?? 0) + 1,
+        losses_since_last_win: 0,
+      }),
+    });
+
+    // ─── RECORD WIN TRANSACTION ────────────────────────────────
+    await fetch(`${supabaseUrl}/rest/v1/transactions`, {
+      method: "POST",
+      headers: { ...headers, "Content-Type": "application/json" },
+      body: JSON.stringify({
+        user_id: winnerUserId,
+        type: "win",
+        amount: prizePool,
+        description: `Won match ${game_id}`,
+        status: "completed",
+      }),
+    });
+
+    // ─── INCREMENT LOSSES FOR ALL OTHER PLAYERS ────────────────
+    const loserIds = userIds.filter(id => id !== winnerUserId);
+    const loserProfilesRes = await fetch(
+      `${supabaseUrl}/rest/v1/profiles?id=in.(${loserIds.join(",")})&select=id,total_losses,losses_since_last_win`,
+      { headers }
+    );
+    const loserProfiles = await loserProfilesRes.json() as Array<{
+      id: string;
+      total_losses: number;
+      losses_since_last_win: number;
+    }>;
+
+    for (const loser of loserProfiles) {
+      await fetch(`${supabaseUrl}/rest/v1/profiles?id=eq.${loser.id}`, {
+        method: "PATCH",
+        headers: { ...headers, "Content-Type": "application/json" },
+        body: JSON.stringify({
+          total_losses: (loser.total_losses ?? 0) + 1,
+          losses_since_last_win: (loser.losses_since_last_win ?? 0) + 1,
+        }),
+      });
+    }
+
+    return new Response(
+      JSON.stringify({
+        message: "Winner selected",
+        winner_id: winnerUserId,
+        was_guaranteed: wasGuaranteed,
+        prize: prizePool,
+      }),
+      { headers: { ...corsHeaders, "Content-Type": "application/json" }, status: 200 }
+    );
+  } catch (error) {
+    return new Response(
+      JSON.stringify({ error: error instanceof Error ? error.message : "Unknown error" }),
+      { headers: { ...corsHeaders, "Content-Type": "application/json" }, status: 500 }
+    );
+  }
+});
